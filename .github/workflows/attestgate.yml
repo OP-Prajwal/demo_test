@@ -1,0 +1,85 @@
+name: AttestGate demo build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: attestgate-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_REPOSITORY: ghcr.io/op-prajwal/demo-test
+  ATTESTGATE_URL: https://attestgate-control-plane.onrender.com
+
+jobs:
+  build-sign-register:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_REPOSITORY }}:${{ github.sha }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4
+
+      - name: Sign image
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+
+      - name: Generate SPDX SBOM for the pushed image
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_REPOSITORY }}@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+
+      - name: Attest SPDX SBOM
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+
+      - name: Create signed build provenance
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          jq -n --arg image "$IMAGE_REPOSITORY" --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" '{imageRepository:$image,sourceRepository:$repo,commitSha:$sha,sourceRef:$ref}' > provenance.json
+          cosign attest --yes --type custom --predicate provenance.json "$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+
+      - name: Register verified build with AttestGate
+        env:
+          ATTESTGATE_TOKEN: ${{ secrets.ATTESTGATE_TOKEN }}
+          ATTESTGATE_INTEGRATION_ID: ${{ vars.ATTESTGATE_INTEGRATION_ID }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          if [ -z "$ATTESTGATE_TOKEN" ] || [ -z "$ATTESTGATE_INTEGRATION_ID" ]; then
+            echo "Image was built, signed, and attested. Add ATTESTGATE_TOKEN and ATTESTGATE_INTEGRATION_ID to register it with AttestGate." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          payload=$(jq -nc --arg image "$IMAGE_REPOSITORY" --arg digest "$IMAGE_DIGEST" --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" '{imageRepository:$image,digest:$digest,sourceRepository:$repo,commitSha:$sha,sourceRef:$ref}')
+          curl --fail-with-body --silent --show-error -X POST "$ATTESTGATE_URL/ci/$ATTESTGATE_INTEGRATION_ID/artifacts" -H "Authorization: Bearer $ATTESTGATE_TOKEN" -H "Content-Type: application/json" -d "$payload"
